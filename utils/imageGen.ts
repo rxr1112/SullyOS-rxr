@@ -1,5 +1,6 @@
 import {
   APIConfig,
+  ApiPreset,
   CharacterProfile,
   ImageGenChatPrefs,
   ImageGenConfig,
@@ -22,6 +23,14 @@ export const DEFAULT_IMAGE_GEN_CONFIG: ImageGenConfig = {
   apiKey: '',
   model: 'dall-e-3',
   autoTrigger: false,
+  llmApi: {
+    enabled: false,
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+  },
+  llmPresets: [],
+  currentLlmPresetId: '',
 };
 
 export const DEFAULT_IMAGE_GEN_CHAT_PREFS: ImageGenChatPrefs = {
@@ -119,6 +128,94 @@ async function callChatLlm(
   return extractContent(data).trim();
 }
 
+export interface LlmCallResult {
+  success: boolean;
+  result: string;
+  error?: string;
+  durationMs: number;
+}
+
+export interface ImagePostProcessResults {
+  summary: LlmCallResult;
+  memoryText: LlmCallResult;
+}
+
+function resolveLlmApiConfig(imageGenConfig: ImageGenConfig, fallbackApiConfig: APIConfig): APIConfig {
+  if (imageGenConfig.llmApi?.enabled && imageGenConfig.llmApi.baseUrl && imageGenConfig.llmApi.apiKey) {
+    return {
+      baseUrl: imageGenConfig.llmApi.baseUrl,
+      apiKey: imageGenConfig.llmApi.apiKey,
+      model: imageGenConfig.llmApi.model || fallbackApiConfig.model,
+      stream: false,
+      temperature: 0.4,
+      minimaxApiKey: '',
+      minimaxGroupId: '',
+      minimaxRegion: 'domestic',
+    };
+  }
+  return fallbackApiConfig;
+}
+
+async function callLlmWithTiming(
+  apiConfig: APIConfig,
+  system: string,
+  user: string,
+  maxTokens = 200,
+  temperature = 0.4,
+): Promise<LlmCallResult> {
+  const startTime = Date.now();
+  try {
+    if (!apiConfig.baseUrl?.trim() || !apiConfig.apiKey?.trim()) {
+      return {
+        success: false,
+        result: '',
+        error: 'LLM API 未配置',
+        durationMs: 0,
+      };
+    }
+    const res = await fetch(chatCompletionsUrl(apiConfig), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiConfig.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: apiConfig.model,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        max_tokens: maxTokens,
+        temperature,
+      }),
+    });
+    const durationMs = Date.now() - startTime;
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      return {
+        success: false,
+        result: '',
+        error: `HTTP ${res.status}: ${errText.slice(0, 150) || res.statusText}`,
+        durationMs,
+      };
+    }
+    const data = await safeResponseJson(res);
+    const result = extractContent(data).trim();
+    return {
+      success: true,
+      result,
+      durationMs,
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      result: '',
+      error: e?.message || '网络请求失败',
+      durationMs: Date.now() - startTime,
+    };
+  }
+}
+
 export function buildImagePrompt(opts: {
   scenePrompt: string;
   prefs: ImageGenChatPrefs;
@@ -131,20 +228,20 @@ export function buildImagePrompt(opts: {
     parts.push(opts.prefs.stylePrefix.trim());
   }
 
-  const charFace = opts.prefs.charFaceLock.trim() || opts.char?.description?.slice(0, 200) || '';
-  const userFace = opts.prefs.userFaceLock.trim() || opts.userProfile?.bio?.slice(0, 150) || '';
+  const charFace = opts.prefs.charFaceLock.trim() || opts.char?.description || '';
+  const userFace = opts.prefs.userFaceLock.trim() || opts.userProfile?.bio || '';
 
   if (charFace) {
-    parts.push(`the character ${opts.char?.name || 'character'}: ${charFace}`);
+    parts.push(`Character appearance of ${opts.char?.name || 'the character'}: ${charFace.slice(0, 500)}`);
   }
   if (userFace) {
-    parts.push(`the user: ${userFace}`);
+    parts.push(`User appearance: ${userFace.slice(0, 300)}`);
   }
 
-  parts.push(`scene: ${opts.scenePrompt.trim()}`);
+  parts.push(`Scene description: ${opts.scenePrompt.trim()}`);
 
-  const full = parts.filter(Boolean).join('. ');
-  return full + '. high quality, detailed';
+  const full = parts.filter(Boolean).join('.\n');
+  return full + '\n\nHigh quality, highly detailed, sharp focus, masterpiece, best quality';
 }
 
 export async function testImageGenConnection(config: ImageGenConfig): Promise<{ ok: boolean; message: string }> {
@@ -323,8 +420,11 @@ export async function generateImage(
   }
   
   if (!rawUrl) {
-    console.error('No image URL found in response:', data);
-    throw new Error('生图 API 未返回图片，请检查控制台日志查看返回数据格式');
+    console.error('No image URL found in response. Full data structure:');
+    console.error('Type:', typeof data);
+    console.error('Keys:', data && typeof data === 'object' ? Object.keys(data) : 'N/A');
+    console.error('JSON:', JSON.stringify(data).slice(0, 500));
+    throw new Error('生图 API 未返回图片，请按 F12 打开控制台查看返回数据格式');
   }
 
   const url = await persistImageUrl(rawUrl);
@@ -632,4 +732,146 @@ export async function createImageLoadingPlaceholder(charId: string, source: 'man
       memoryText: '',
     } satisfies Partial<ImageWithVoiceMetadata>,
   });
+}
+
+export async function postProcessImage(opts: {
+  imageGenConfig: ImageGenConfig;
+  fallbackApiConfig: APIConfig;
+  prompt: string;
+  charName: string;
+  source: 'manual' | 'auto';
+}): Promise<ImagePostProcessResults> {
+  const llmConfig = resolveLlmApiConfig(opts.imageGenConfig, opts.fallbackApiConfig);
+
+  const summarySystem = `你是图片内容分析专家。请根据生图提示词，生成一段详细、准确的图片内容描述（100-150字）。
+
+要求：
+1. 仔细提取提示词中所有关于人物外貌的细节：发型、发色、瞳色、脸型、肤色、妆容等
+2. 仔细提取所有服饰细节：上衣、裤子/裙子、鞋子、配饰（手表、手串、项链、眼镜、帽子等）
+3. 仔细提取场景细节：地点、时间、光线、背景物品、氛围
+4. 仔细提取动作和表情：人物在做什么、表情如何、姿态怎样
+5. 区分不同人物（角色 vs 用户），不要混淆
+6. 客观描述，只写提示词中明确提到的内容，不要脑补
+7. 用中文，描述要具体、有画面感
+
+直接输出描述文字，不要任何前缀或解释。`;
+
+  const summaryUser = `生图提示词：
+${opts.prompt.slice(0, 800)}`;
+
+  const memorySystem = `你是图片记忆摘要专家。请根据生图提示词和画面描述，生成一段详细的记忆摘要（120-180字）。
+
+要求：
+1. 开头格式：【角色名】发送了一张图片
+2. 详细描述画面中的人物外貌特征（发型、发色、瞳色、妆容等）
+3. 详细描述服饰和配饰（上衣、下装、鞋子、手表、手串、项链、眼镜等所有细节）
+4. 描述场景和环境（地点、背景物品、光线、氛围）
+5. 描述人物的动作和表情
+6. 区分角色和用户，不要混淆
+7. 客观描述，只写提示词中明确有的内容，不要脑补
+8. 用中文，语言自然流畅，像在描述一张真实的照片
+
+只输出摘要，不要引号或其他前缀。`;
+
+  const summaryPromise = callLlmWithTiming(llmConfig, summarySystem, summaryUser, 200, 0.3);
+
+  const summaryResult = await summaryPromise;
+  const summaryText = summaryResult.success && summaryResult.result.length >= 30
+    ? summaryResult.result
+    : opts.prompt.slice(0, 100);
+
+  const memoryUser = `角色名：${opts.charName}
+发送方式：${opts.source === 'manual' ? '用户要求发送' : '主动发送'}
+
+生图提示词：
+${opts.prompt.slice(0, 600)}
+
+画面描述：
+${summaryText.slice(0, 400)}`;
+
+  const memoryPromise = callLlmWithTiming(llmConfig, memorySystem, memoryUser, 250, 0.3);
+
+  const memoryResult = await memoryPromise;
+  const memoryText = memoryResult.success && memoryResult.result.length >= 30
+    ? memoryResult.result.slice(0, 200)
+    : `【${opts.charName}】${opts.source === 'manual' ? '被要求发送' : '主动发送'}了一张图片，内容是：${summaryText.slice(0, 80)}`;
+
+  return {
+    summary: {
+      ...summaryResult,
+      result: summaryText,
+    },
+    memoryText: {
+      ...memoryResult,
+      result: memoryText,
+    },
+  };
+}
+
+export async function testImageLlmConnection(config: ImageGenConfig): Promise<{ ok: boolean; message: string }> {
+  if (!config.llmApi?.enabled) {
+    return { ok: false, message: '请先启用独立 LLM' };
+  }
+  if (!config.llmApi.baseUrl || !config.llmApi.apiKey) {
+    return { ok: false, message: '请填写 LLM API 地址与密钥' };
+  }
+  if (!config.llmApi.model) {
+    return { ok: false, message: '请先选择 LLM 模型' };
+  }
+
+  const llmConfig: APIConfig = {
+    baseUrl: config.llmApi.baseUrl,
+    apiKey: config.llmApi.apiKey,
+    model: config.llmApi.model,
+    stream: false,
+    temperature: 0.4,
+    minimaxApiKey: '',
+    minimaxGroupId: '',
+    minimaxRegion: 'domestic',
+  };
+
+  try {
+    const result = await callLlmWithTiming(
+      llmConfig,
+      '你是一个测试助手。',
+      '请回复"连接成功"四个字。',
+      50,
+      0.3,
+    );
+    if (result.success) {
+      return { ok: true, message: `连接成功，LLM 可用 (模型: ${config.llmApi.model})` };
+    } else {
+      return { ok: false, message: result.error || '连接失败' };
+    }
+  } catch (e: any) {
+    return { ok: false, message: e?.message || '网络请求失败' };
+  }
+}
+
+export async function fetchImageLlmModels(config: ImageGenConfig): Promise<{ id: string; name: string }[]> {
+  if (!config.llmApi?.enabled || !config.llmApi.baseUrl || !config.llmApi.apiKey) {
+    return [];
+  }
+
+  try {
+    const base = config.llmApi.baseUrl.replace(/\/+$/, '');
+    const modelsUrl = `${base}/models`;
+
+    const res = await fetch(modelsUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.llmApi.apiKey}`,
+      },
+    });
+
+    if (!res.ok) return [];
+    const data = await safeResponseJson(res);
+    const models = data?.data || [];
+    return models
+      .filter((m: any) => m.id)
+      .map((m: any) => ({ id: m.id, name: m.name || m.id }));
+  } catch {
+    return [];
+  }
 }

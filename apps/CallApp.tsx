@@ -697,14 +697,20 @@ const CallApp: React.FC = () => {
     const allMsgs = await DB.getRecentMessagesByCharId(selectedChar.id, limit);
     const filtered = allMsgs.filter(m => !(skipDbId && m.id === skipDbId));
     const history = filtered.map(m => {
-      const source = m.metadata?.source === 'call' ? '（通话记录）' : m.metadata?.source === 'date' ? '（约会记录）' : '（聊天记录）';
-      const content = m.type === 'image'
-        ? '[用户发送了一张图片]'
-        : m.type === 'emoji'
-          ? '[发送了一个表情]'
-          : m.content;
-      return { role: m.role, content: `[${new Date(m.timestamp).toLocaleString('zh-CN')}] ${source} ${content}` };
-    });
+      const source = m.metadata?.source === 'call' ? '（通话）' : m.metadata?.source === 'date' ? '（约会）' : '';
+      let content = m.content;
+      if (m.type === 'image' || m.type === 'image_with_voice') {
+        const summary = m.metadata?.imageGen?.summary || m.metadata?.memoryText;
+        const sender = m.role === 'assistant' ? (selectedChar?.name || '角色') : (userProfile?.name || '用户');
+        content = `[${sender}发送了一张图片：${summary || '画面内容未知'}]`;
+      } else if (m.type === 'emoji') {
+        content = '[发送了一个表情]';
+      } else if (m.type === 'system' || m.role === 'system') {
+        return null;
+      }
+      if (!content || !content.trim()) return null;
+      return { role: m.role, content: source ? `${source} ${content}` : content };
+    }).filter(Boolean) as { role: string; content: string }[];
     const lastMsg = filtered[filtered.length - 1];
     const timeGapHint = ChatPrompts.getTimeGapHint(lastMsg, Date.now());
     const finalInput = timeGapHint ? `${input}\n\n${timeGapHint}` : input;

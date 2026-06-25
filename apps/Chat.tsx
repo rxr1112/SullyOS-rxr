@@ -45,6 +45,7 @@ import {
     generateImageMemoryText,
     summarizeImageForContext,
     loadImageGenChatPrefs,
+    postProcessImage,
 } from '../utils/imageGen';
 import type { ImageGenChatPrefs } from '../types';
 
@@ -666,14 +667,16 @@ const Chat: React.FC = () => {
             await reloadMessages(visibleCountRef.current);
 
             const result = await generateImage(scenePrompt, cfg, prefs, targetChar, userProfile);
-            const summary = await summarizeImageForContext(apiConfig, result.prompt);
-            const memoryText = await generateImageMemoryText({
-                apiConfig,
-                charName: targetChar.name,
-                summary,
-                source,
+            const postProcessResults = await postProcessImage({
+                imageGenConfig: cfg,
+                fallbackApiConfig: apiConfig,
                 prompt: result.prompt,
+                charName: targetChar.name,
+                source,
             });
+
+            const summary = postProcessResults.summary.result;
+            const memoryText = postProcessResults.memoryText.result;
 
             await deliverImageWithVoiceMessage({
                 charId: targetChar.id,
@@ -696,15 +699,23 @@ const Chat: React.FC = () => {
             if (source === 'manual') {
                 await DB.saveMessage({
                     charId: targetChar.id,
-                    role: 'user' as const,
-                    type: 'text' as const,
-                    content: `我让你生成了一张图片`,
-                    metadata: { source: 'image_gen_trigger' },
+                    role: 'system',
+                    type: 'text' as MessageType,
+                    content: `${userProfile.name}死缠烂打拜托${targetChar.name}发了一张图片`,
                 });
             }
 
             await reloadMessages(visibleCountRef.current);
-            if (source === 'manual') addToast('图片已发送', 'success');
+
+            const allSuccess = postProcessResults.summary.success && postProcessResults.memoryText.success;
+            if (allSuccess) {
+                addToast('图片后处理完成', 'success');
+            } else {
+                const failed = [];
+                if (!postProcessResults.summary.success) failed.push('图片摘要');
+                if (!postProcessResults.memoryText.success) failed.push('记忆文本');
+                addToast(`${failed.join('、')} 生成失败，使用默认值`, 'info');
+            }
         } catch (e: any) {
             if (placeholderId) {
                 try { await DB.deleteMessage(placeholderId); } catch { /* ignore */ }

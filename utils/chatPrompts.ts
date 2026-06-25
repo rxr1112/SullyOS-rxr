@@ -760,6 +760,15 @@ ${VOICE_ACTING_GUIDE}`;
             if (lastRealMsg && currentMsg && char.timeAwarenessEnabled !== false) timeGapHint = ChatPrompts.getTimeGapHint(lastRealMsg, currentMsg.timestamp);
         }
 
+        const VISION_IMAGE_LIMIT = 4;
+        const imageIndices: number[] = [];
+        historySlice.forEach((m, i) => {
+            if ((m.type === 'image' || m.type === 'image_with_voice') && typeof m.content === 'string' && (m.content.startsWith('data:') || m.content.startsWith('http'))) {
+                imageIndices.push(i);
+            }
+        });
+        const visionImageIndices = new Set(imageIndices.slice(-VISION_IMAGE_LIMIT));
+
         return {
             apiMessages: historySlice.map((m, index) => {
                 let content: any = m.content;
@@ -799,11 +808,20 @@ ${VOICE_ACTING_GUIDE}`;
                     const memText = m.metadata?.memoryText?.trim() || '[Assistant sent an image]';
                     const imageGen = m.metadata?.imageGen;
                     let detailText = memText;
-                    if (imageGen?.prompt && !memText.includes(imageGen.prompt.slice(0, 20))) {
-                        detailText = `${memText}（生图提示词: ${imageGen.prompt.slice(0, 100)}）`;
+                    if (imageGen?.summary && !memText.includes(imageGen.summary.slice(0, 20))) {
+                        detailText = `${detailText}
+画面细节：${imageGen.summary}`;
                     }
                     const sender = m.role === 'assistant' ? char.name : 'User';
                     const textPart = `${timeStr} [${sender} sent an image: ${detailText}]`;
+                    const hasImageData = typeof m.content === 'string' && (m.content.startsWith('data:') || m.content.startsWith('http'));
+                    const useVision = hasImageData && visionImageIndices.has(index);
+                    if (useVision) {
+                        if (index === historySlice.length - 1 && timeGapHint && m.role === 'user') {
+                            return { role: m.role, content: [{ type: "text", text: textPart + `\n\n${timeGapHint}` }, { type: "image_url", image_url: { url: m.content } }] };
+                        }
+                        return { role: m.role, content: [{ type: "text", text: textPart }, { type: "image_url", image_url: { url: m.content } }] };
+                    }
                     if (index === historySlice.length - 1 && timeGapHint && m.role === 'user') return { role: m.role, content: textPart + `\n\n${timeGapHint}` };
                     return { role: m.role, content: textPart };
                 }
@@ -811,11 +829,14 @@ ${VOICE_ACTING_GUIDE}`;
                 if (m.type === 'image') {
                      // 向下兼容：如果图片数据缺失（例如只导入了文字备份），不要把空 URL 发给 API，否则会报错无法回应
                      const hasImageData = typeof m.content === 'string' && (m.content.startsWith('data:') || m.content.startsWith('http'));
+                     const useVision = hasImageData && visionImageIndices.has(index);
+                     const desc = m.metadata?.summary || m.metadata?.memoryText || '';
+                     const sender = m.role === 'assistant' ? char.name : 'User';
                      let textPart = hasImageData
-                         ? `${timeStr} [User sent an image]`
-                         : `${timeStr} [User sent an image, but the image data is no longer available]`;
+                         ? `${timeStr} [${sender} sent an image${desc ? `: ${desc}` : ''}]`
+                         : `${timeStr} [${sender} sent an image, but the image data is no longer available]`;
                      if (index === historySlice.length - 1 && timeGapHint && m.role === 'user') textPart += `\n\n${timeGapHint}`;
-                     if (!hasImageData) {
+                     if (!hasImageData || !useVision) {
                          return { role: m.role, content: textPart };
                      }
                      return { role: m.role, content: [{ type: "text", text: textPart }, { type: "image_url", image_url: { url: m.content } }] };

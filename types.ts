@@ -121,6 +121,17 @@ export interface ImageGenConfig {
   model?: string;
   /** 开启后 AI 可在回复中自行判断是否发图 */
   autoTrigger: boolean;
+  /** 生图后处理 LLM 配置（用于图片摘要、记忆生成） */
+  llmApi?: {
+    enabled: boolean;
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+  };
+  /** 生图 LLM 预设列表 */
+  llmPresets?: ApiPreset[];
+  /** 当前使用的生图 LLM 预设 ID */
+  currentLlmPresetId?: string;
 }
 
 /** 聊天输入栏生图偏好（按角色存 localStorage） */
